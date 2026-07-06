@@ -4,7 +4,7 @@ import AppKit
 enum Theme {
     static let bg = Color(red: 0.07, green: 0.08, blue: 0.11)
     static let claude = Color(red: 0.85, green: 0.47, blue: 0.34)
-    static let codex = Color(red: 0.31, green: 0.82, blue: 0.72)
+    static let codex = Color(red: 0.47, green: 0.47, blue: 0.95)
     static let text = Color.white.opacity(0.92)
     static let sub = Color.white.opacity(0.45)
     static let grid = Color.white.opacity(0.10)
@@ -113,7 +113,7 @@ struct ServiceSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 9) {
-                PixelGlyphView(glyph: glyph, color: accent, pixel: 2.5)
+                PixelGlyphView(glyph: glyph, color: accent, pixel: 20 / CGFloat(glyph.rows.count))
                 Text(name)
                     .font(.system(size: 12, weight: .heavy, design: .monospaced))
                     .kerning(2)

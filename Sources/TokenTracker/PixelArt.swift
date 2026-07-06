@@ -48,7 +48,7 @@ struct PixelGlyph {
 
 enum StatusRenderer {
     static let claudeColor = NSColor(calibratedRed: 0.85, green: 0.47, blue: 0.34, alpha: 1)
-    static let codexColor = NSColor(calibratedRed: 0.31, green: 0.82, blue: 0.72, alpha: 1)
+    static let codexColor = NSColor(calibratedRed: 0.47, green: 0.47, blue: 0.95, alpha: 1)
 
     static func image(claude: Double?, codex: Double?) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold)
