@@ -7,10 +7,7 @@ A tiny pixel-art macOS menu bar app that shows your Claude Code and Codex
 menu bar:   ✳ 66%   ⬡ 95%         (% of the 5-hour window still LEFT)
 ```
 
-<!-- Add a screenshot before publishing: save one as docs/screenshot.png,
-     then replace this comment with:
 ![Token Tracker popover](docs/screenshot.png)
--->
 
 > **Unofficial tool** — not affiliated with or endorsed by Anthropic or OpenAI.
 > It reads only your own usage data and relies on undocumented internals (see
