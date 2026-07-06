@@ -122,9 +122,18 @@ enum CodexReader {
             files.append((url, d))
         }
         files.sort { $0.1 > $1.1 }
-        for (url, _) in files.prefix(8) {
-            if let u = parse(url: url) { return u }
+        // Resuming an old session bumps its file's mtime without necessarily
+        // logging a fresh rate_limits event, so the newest file can carry stale
+        // numbers. Keep the newest event across candidates instead; stop once
+        // no remaining file can win (events are never newer than their mtime).
+        var best: (usage: ServiceUsage, at: Date)? = nil
+        for (url, mtime) in files.prefix(8) {
+            if let b = best, b.at >= mtime { break }
+            guard let u = parse(url: url) else { continue }
+            let at = u.asOf ?? mtime
+            if best == nil || at > best!.at { best = (u, at) }
         }
+        if let best { return best.usage }
         return ServiceUsage(error: "NO CODEX USAGE DATA")
     }
 
