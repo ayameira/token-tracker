@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+TokenTracker.app/
+.DS_Store
