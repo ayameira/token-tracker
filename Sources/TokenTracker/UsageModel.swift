@@ -1,8 +1,11 @@
 import Foundation
+import Combine
+import CoreGraphics
 
 struct WindowUsage {
     var percent: Double // used, 0-100
     var resetsAt: Date?
+    var asOf: Date? = nil // when this figure was observed, for staleness
     var remaining: Double { min(100, max(0, 100 - percent)) }
 }
 
@@ -13,6 +16,9 @@ struct ServiceUsage {
     var error: String? = nil
     var staleNote: String? = nil // data shown is old; this says why
     var asOf: Date? = nil
+    var retryAfter: TimeInterval? = nil // server-dictated backoff (429 Retry-After)
+    var organizationID: String? = nil
+    var source: String? = nil
 }
 
 enum Dates {
@@ -38,73 +44,123 @@ enum Dates {
     }
 }
 
-// MARK: - Claude (Keychain OAuth token -> Anthropic usage endpoint)
+// MARK: - Claude Desktop plan-usage snapshots
+
+enum ClaudeDesktopUsageHistory {
+    private struct Sample {
+        let asOf: Date
+        let organizationID: String?
+        let session: WindowUsage?
+        let weekly: WindowUsage?
+    }
+
+    static func read() -> ServiceUsage? {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Claude/plan-usage-history.json")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let samples = root["samples"] as? [[String: Any]] else { return nil }
+
+        guard let latest = samples.compactMap(sample).max(by: { $0.asOf < $1.asOf }) else {
+            return nil
+        }
+        guard latest.session != nil || latest.weekly != nil else { return nil }
+        return ServiceUsage(session: latest.session,
+                            weekly: latest.weekly,
+                            asOf: latest.asOf,
+                            organizationID: latest.organizationID, source: "DESKTOP SNAPSHOT")
+    }
+
+    private static func sample(_ object: [String: Any]) -> Sample? {
+        guard let rawTime = (object["t"] as? NSNumber)?.doubleValue,
+              rawTime.isFinite, rawTime > 0,
+              let usage = object["u"] as? [String: Any] else { return nil }
+
+        let timestamp = rawTime > 1e11 ? rawTime / 1000 : rawTime
+        let asOf = Date(timeIntervalSince1970: timestamp)
+        guard asOf <= Date().addingTimeInterval(5 * 60) else { return nil }
+
+        let session = window(usage["fh"], asOf: asOf)
+        let weekly = window(usage["sd"], asOf: asOf)
+        guard session != nil || weekly != nil else { return nil }
+        return Sample(asOf: asOf, organizationID: object["org"] as? String, session: session, weekly: weekly)
+    }
+
+    private static func window(_ value: Any?, asOf: Date) -> WindowUsage? {
+        guard let number = value as? NSNumber else { return nil }
+        let percent = number.doubleValue
+        guard percent.isFinite, (0...100).contains(percent) else { return nil }
+        return WindowUsage(percent: percent, resetsAt: nil, asOf: asOf)
+    }
+}
+
+// MARK: - Claude usage response parsing
 
 enum ClaudeReader {
-    static func read() -> ServiceUsage {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        proc.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        let out = Pipe()
-        proc.standardOutput = out
-        proc.standardError = Pipe()
-        do { try proc.run() } catch {
-            return ServiceUsage(error: "KEYCHAIN UNAVAILABLE")
+    static func parse(body: Data) -> ServiceUsage {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            return ServiceUsage(error: "BAD RESPONSE")
         }
-        proc.waitUntilExit()
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        guard proc.terminationStatus == 0,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = obj["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String else {
-            return ServiceUsage(error: "NO CLAUDE CODE LOGIN")
+        // The windows moved out of the response root into `rate_limits`,
+        // alongside `subscription_type` / `rate_limits_available`. Fall back to
+        // the root so an older server still parses.
+        guard obj["rate_limits_available"] as? Bool != false else {
+            return ServiceUsage(error: "PLAN LIMITS N/A — API KEY")
         }
+        let limits = (obj["rate_limits"] as? [String: Any]) ?? obj
+        var u = ServiceUsage()
+        u.plan = obj["subscription_type"] as? String
+        let now = Date()
+        u.session = window(limits["five_hour"])
+        u.weekly = window(limits["seven_day"])
+        u.session?.asOf = now
+        u.weekly?.asOf = now
+        u.asOf = now
+        if u.session == nil && u.weekly == nil {
+            return ServiceUsage(plan: u.plan, error: "NO USAGE WINDOWS")
+        }
+        return u
+    }
 
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        req.timeoutInterval = 10
-
-        let sem = DispatchSemaphore(value: 0)
-        var result = ServiceUsage(error: "NETWORK ERROR")
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
-            defer { sem.signal() }
-            guard let http = resp as? HTTPURLResponse, let data else { return }
-            guard http.statusCode == 200 else {
-                switch http.statusCode {
-                case 401, 403:
-                    result = ServiceUsage(error: "TOKEN EXPIRED — OPEN CLAUDE CODE")
-                case 429:
-                    result = ServiceUsage(error: "RATE LIMITED — WILL RETRY")
-                default:
-                    result = ServiceUsage(error: "HTTP \(http.statusCode)")
-                }
-                return
-            }
-            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                result = ServiceUsage(error: "BAD RESPONSE")
-                return
-            }
-            var u = ServiceUsage()
-            if let w = obj["five_hour"] as? [String: Any] {
-                u.session = WindowUsage(percent: (w["utilization"] as? Double) ?? 0,
-                                        resetsAt: Dates.parseISO(w["resets_at"] as? String))
-            }
-            if let w = obj["seven_day"] as? [String: Any] {
-                u.weekly = WindowUsage(percent: (w["utilization"] as? Double) ?? 0,
-                                       resetsAt: Dates.parseISO(w["resets_at"] as? String))
-            }
-            u.asOf = Date()
-            result = u
-        }.resume()
-        _ = sem.wait(timeout: .now() + 15)
-        return result
+    /// `utilization` is a 0-100 percentage, but both it and the window itself
+    /// are nullable — a plan that has no such window sends null, which is an
+    /// absent bar, not a 0%-used one.
+    private static func window(_ any: Any?) -> WindowUsage? {
+        guard let d = any as? [String: Any],
+              let pct = d["utilization"] as? Double, pct.isFinite, (0...100).contains(pct) else { return nil }
+        return WindowUsage(percent: pct,
+                           resetsAt: Dates.parseISO(d["resets_at"] as? String))
     }
 }
 
 // MARK: - Codex (rate_limits events in ~/.codex/sessions rollout logs)
 
 enum CodexReader {
+    /// One limit bucket's most recent reading. Codex meters several buckets at
+    /// once — `codex` for overall usage, plus model-specific ones such as
+    /// `codex_bengalfox` (GPT-5.3-Codex-Spark) — and each session logs only the
+    /// bucket it is billing against, so the newest event on disk is not
+    /// necessarily the bucket that is actually constraining you.
+    private struct Reading {
+        var limitID: String
+        var session: WindowUsage?
+        var weekly: WindowUsage?
+        var plan: String?
+        var at: Date
+    }
+
+    // How far back to look for a bucket's newest event. A session that switches
+    // model logs the old bucket well before the end of the file, so the first
+    // scan reaches deep; after that only the tail can hold anything new.
+    private static let firstScan: UInt64 = 16 * 1024 * 1024
+    private static let tailScan: UInt64 = 512 * 1024
+
+    // Rollout logs are append-only, so a file whose mtime hasn't moved cannot
+    // have a newer event than last time we looked. Caching on mtime keeps the
+    // 15-second refresh from re-reading megabytes of unchanged logs.
+    private static let lock = NSLock()
+    private static var cache: [URL: (mtime: Date, readings: [String: Reading])] = [:]
+
     static func read() -> ServiceUsage {
         let root = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/sessions")
@@ -122,44 +178,91 @@ enum CodexReader {
             files.append((url, d))
         }
         files.sort { $0.1 > $1.1 }
-        // Resuming an old session bumps its file's mtime without necessarily
-        // logging a fresh rate_limits event, so the newest file can carry stale
-        // numbers. Keep the newest event across candidates instead; stop once
-        // no remaining file can win (events are never newer than their mtime).
-        var best: (usage: ServiceUsage, at: Date)? = nil
-        for (url, mtime) in files.prefix(8) {
-            if let b = best, b.at >= mtime { break }
-            guard let u = parse(url: url) else { continue }
-            let at = u.asOf ?? mtime
-            if best == nil || at > best!.at { best = (u, at) }
+
+        // Scan a window of recent sessions rather than just the newest: the
+        // buckets interleave, so the newest reading for one can sit several
+        // files behind the newest reading for another.
+        let recent = Array(files.prefix(16))
+        var newestPerBucket: [String: Reading] = [:]
+        for (url, mtime) in recent {
+            for (id, r) in readings(url: url, mtime: mtime) {
+                if let seen = newestPerBucket[id], seen.at >= r.at { continue }
+                newestPerBucket[id] = r
+            }
         }
-        if let best { return best.usage }
-        return ServiceUsage(error: "NO CODEX USAGE DATA")
+        let readings = Array(newestPerBucket.values)
+        guard !readings.isEmpty else { return ServiceUsage(error: "NO CODEX USAGE DATA") }
+
+        // You hit whichever bucket is furthest along first, so each bar shows
+        // the worst case across buckets instead of whoever logged most recently.
+        var u = ServiceUsage()
+        u.session = readings.compactMap(\.session).max { $0.percent < $1.percent }
+        u.weekly = readings.compactMap(\.weekly).max { $0.percent < $1.percent }
+        let newest = readings.max { $0.at < $1.at }
+        u.plan = newest?.plan
+        u.asOf = newest?.at
+        if u.session == nil && u.weekly == nil { return ServiceUsage(error: "NO CODEX USAGE DATA") }
+        return u
     }
 
-    private static func parse(url: URL) -> ServiceUsage? {
-        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+    private static func readings(url: URL, mtime: Date) -> [String: Reading] {
+        lock.lock()
+        let hit = cache[url]
+        lock.unlock()
+        if let hit, hit.mtime == mtime { return hit.readings }
+
+        // Append-only: once a file has been scanned, only its tail can hold
+        // anything new, so merge a cheap tail read over what we already had
+        // instead of re-reading megabytes every 15 seconds.
+        let fresh = parse(url: url, limit: hit == nil ? firstScan : tailScan)
+        var merged = hit?.readings ?? [:]
+        for (id, r) in fresh where (merged[id]?.at ?? .distantPast) < r.at {
+            merged[id] = r
+        }
+        lock.lock()
+        // Bound the cache to roughly the scan window so it can't grow forever.
+        if cache.count > 200 { cache.removeAll() }
+        cache[url] = (mtime, merged)
+        lock.unlock()
+        return merged
+    }
+
+    private static func parse(url: URL, limit: UInt64) -> [String: Reading] {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return [:] }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
-        let chunk: UInt64 = 512 * 1024
-        try? fh.seek(toOffset: size > chunk ? size - chunk : 0)
+        try? fh.seek(toOffset: size > limit ? size - limit : 0)
         guard let data = try? fh.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return nil }
+              let text = String(data: data, encoding: .utf8) else { return [:] }
 
+        // A session bills against a different bucket when the model changes, so
+        // one file can hold several. Scanning backwards, the first reading seen
+        // for a bucket is its newest — keep collecting instead of stopping at
+        // the first event, or a mid-session model switch hides the other bucket.
+        var found: [String: Reading] = [:]
         for line in text.split(separator: "\n").reversed() {
             guard line.contains("\"rate_limits\"") else { continue }
             guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                   let payload = obj["payload"] as? [String: Any],
                   let rl = payload["rate_limits"] as? [String: Any] else { continue }
-            var u = ServiceUsage()
-            u.plan = rl["plan_type"] as? String
-            u.session = window(rl["primary"])
-            u.weekly = window(rl["secondary"])
-            u.asOf = Dates.parseISO(obj["timestamp"] as? String)
-            if u.session == nil && u.weekly == nil { continue }
-            return u
+            var r = Reading(limitID: (rl["limit_id"] as? String) ?? "codex",
+                            plan: rl["plan_type"] as? String,
+                            at: Dates.parseISO(obj["timestamp"] as? String) ?? .distantPast)
+            // `primary`/`secondary` are positional, not fixed windows: the
+            // overall bucket now sends its weekly window in `primary` with
+            // `secondary` null, while model-specific buckets still send 5h then
+            // weekly. Route each by its own length instead of its position.
+            for key in ["primary", "secondary"] {
+                guard let dict = rl[key] as? [String: Any],
+                      var w = window(dict) else { continue }
+                w.asOf = r.at
+                let mins = (dict["window_minutes"] as? Double) ?? 0
+                if mins >= 1440 { r.weekly = w } else { r.session = w }
+            }
+            if r.session == nil && r.weekly == nil { continue }
+            if found[r.limitID] == nil { found[r.limitID] = r }
         }
-        return nil
+        return found
     }
 
     private static func window(_ any: Any?) -> WindowUsage? {
@@ -209,57 +312,67 @@ final class UsageStore: ObservableObject {
     @Published var lastUpdated: Date?
     var onUpdate: (() -> Void)?
     private var refreshing = false
-    private var lastClaudeAttempt: Date?
-    private var claudeBackoffUntil: Date?
+    private var polling = ClaudePolling()
 
-    // Codex is a local file read — free, refreshed every tick (~15s).
-    // Claude hits Anthropic's usage endpoint, which 429s under sustained
-    // fast polling: 3 min while Claude Code is actively in use (numbers are
-    // moving), 15 min when idle (they aren't), 15-min backoff after a 429.
-    private func claudeGap(force: Bool) -> TimeInterval {
-        if force { return 60 }
-        return ClaudeActivity.isActive() ? 180 : 15 * 60
-    }
-
-    func refreshAll(forceClaude: Bool = false) {
+    func refreshAll(forceClaude: Bool = false, opening: Bool = false) {
         guard !refreshing else { return }
         refreshing = true
-
         let now = Date()
-        var claudeDue: Bool
-        if let until = claudeBackoffUntil, now < until, !forceClaude {
-            claudeDue = false
-        } else {
-            let gap = claudeGap(force: forceClaude)
-            claudeDue = lastClaudeAttempt.map { now.timeIntervalSince($0) >= gap } ?? true
+        // System idle time is metadata only: no input events or UI are captured.
+        let active = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: UInt32.max)!) < 300 || ClaudeActivity.isActive()
+        let interval = ClaudePolling.interval(
+            configured: UserDefaults.standard.double(forKey: "ClaudePollSeconds"), active: active)
+        // Keychain repair may retry immediately after a user click; server backoff cannot.
+        if forceClaude, claude.error == "CLICK REFRESH TO ALLOW KEYCHAIN" ||
+            claude.staleNote == "CLICK REFRESH TO ALLOW KEYCHAIN" {
+            polling.notBefore = nil
+            polling.lastAttempt = nil
         }
-        if claudeDue { lastClaudeAttempt = now }
+        let due = polling.due(now: now, interval: interval, force: forceClaude || opening)
+        if due { polling.lastAttempt = now }
 
         DispatchQueue.global(qos: .utility).async {
             let codex = CodexReader.read()
-            let claude = claudeDue ? ClaudeReader.read() : nil
+            let desktop = ClaudeDesktopUsageHistory.read()
+            let live = due ? ClaudeWebReader.read(organizationID: desktop?.organizationID,
+                                                  allowKeychainPrompt: forceClaude) : nil
             DispatchQueue.main.async {
                 self.codex = codex
-                if let claude {
-                    if let err = claude.error {
-                        if err.contains("RATE LIMITED") {
-                            self.claudeBackoffUntil = Date().addingTimeInterval(15 * 60)
-                        }
-                        if self.claude.session != nil {
-                            // Keep last good numbers; note why they're stale.
-                            self.claude.staleNote = err
-                        } else {
-                            self.claude = claude
-                        }
+                if let desktop, let currentOrg = self.claude.organizationID,
+                   desktop.organizationID != currentOrg {
+                    self.claude = desktop
+                }
+                if let live {
+                    self.polling.record(live, now: Date())
+                    if live.error == nil {
+                        self.claude = live
                     } else {
-                        self.claudeBackoffUntil = nil
-                        self.claude = claude
+                        self.claude = Self.fallback(current: self.claude, desktop: desktop, error: live.error!)
                     }
+                } else if let desktop,
+                          desktop.asOf ?? .distantPast > self.claude.asOf ?? .distantPast {
+                    var updated = desktop
+                    updated.staleNote = self.claude.staleNote ?? self.claude.error
+                    self.claude = updated
                 }
                 self.lastUpdated = Date()
                 self.refreshing = false
                 self.onUpdate?()
             }
         }
+    }
+
+    static func fallback(current: ServiceUsage, desktop: ServiceUsage?, error: String) -> ServiceUsage {
+        var result = current
+        if let desktop, desktop.asOf ?? .distantPast > current.asOf ?? .distantPast {
+            result = desktop
+        }
+        if result.session != nil || result.weekly != nil {
+            result.error = nil
+            result.staleNote = error
+        } else {
+            result = ServiceUsage(error: error)
+        }
+        return result
     }
 }

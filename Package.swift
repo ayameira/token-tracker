@@ -5,6 +5,7 @@ let package = Package(
     name: "TokenTracker",
     platforms: [.macOS(.v13)],
     targets: [
-        .executableTarget(name: "TokenTracker", path: "Sources/TokenTracker")
+        .executableTarget(name: "TokenTracker", path: "Sources/TokenTracker"),
+        .testTarget(name: "TokenTrackerTests", dependencies: ["TokenTracker"])
     ]
 )

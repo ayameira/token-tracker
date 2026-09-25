@@ -92,8 +92,21 @@ struct BarRow: View {
 
     private var caption: String? {
         guard let window else { return nil }
-        if let r = window.resetsAt { return Dates.resetLabel(r) }
-        return window.percent == 0 ? "WINDOW RESET" : nil
+        var parts: [String] = []
+        if let r = window.resetsAt {
+            parts.append(Dates.resetLabel(r))
+        } else if window.percent == 0 {
+            parts.append("WINDOW RESET")
+        }
+        // A window only moves when its own limit bucket reports, so a figure can
+        // sit still for hours while you keep working against a different one.
+        // Say how old it is rather than letting it read as current.
+        if let a = window.asOf, Date().timeIntervalSince(a) > 15 * 60 {
+            let f = DateFormatter()
+            f.dateFormat = "h:mm a"
+            parts.append("AS OF \(f.string(from: a))".uppercased())
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 
@@ -104,7 +117,7 @@ struct ServiceSection: View {
     let usage: ServiceUsage
 
     private func staleText(_ note: String) -> String {
-        guard let asOf = usage.asOf else { return note }
+        guard usage.source == nil, let asOf = usage.asOf else { return note }
         let f = DateFormatter()
         f.dateFormat = "h:mm a"
         return "\(note) · AS OF \(f.string(from: asOf))".uppercased()
@@ -136,6 +149,11 @@ struct ServiceSection: View {
             } else {
                 BarRow(label: "5H", window: usage.session)
                 BarRow(label: "7D", window: usage.weekly)
+                if let source = usage.source, let asOf = usage.asOf {
+                    Text("\(source) · AS OF \(asOf.formatted(date: .omitted, time: .standard))".uppercased())
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundColor(Theme.sub)
+                }
                 if let note = usage.staleNote {
                     Text(staleText(note))
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
@@ -192,6 +210,6 @@ struct UsageView: View {
         guard let d = store.lastUpdated else { return "LOADING..." }
         let f = DateFormatter()
         f.dateFormat = "h:mm a"
-        return "% LEFT · UPDATED \(f.string(from: d))".uppercased()
+        return "% LEFT · CHECKED \(f.string(from: d))".uppercased()
     }
 }
